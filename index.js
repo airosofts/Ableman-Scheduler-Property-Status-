@@ -119,10 +119,169 @@ async function processAutoTransitions() {
   }
 }
 
+// ─── Kaizen FSBO Lead Fetcher ────────────────────────────────────────────────
+
+function normalizeLead(raw) {
+  return {
+    address:     raw.address || raw.street_address || raw.exact_street_address || '',
+    price:       raw.price ?? raw.asking_price ?? null,
+    seller_name: raw.seller_name || raw.sellerName || raw.seller || '',
+    phone:       raw.phone || raw.phone_number || '',
+    images:      raw.images || raw.photos || raw.hosted_property_photos || [],
+  };
+}
+
+async function fetchKaizenPage(cursor) {
+  const url = cursor
+    ? `https://api.kaizendata.co/enterprise/leads/raw?limit=100&cursor=${cursor}`
+    : `https://api.kaizendata.co/enterprise/leads/raw?limit=100`;
+
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${process.env.KAIZEN_API_KEY}` },
+    signal: AbortSignal.timeout(25000),
+  });
+
+  if (!res.ok) throw new Error(`Kaizen API ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+async function fetchAllKaizenLeads() {
+  const leads = [];
+  let cursor = null;
+  let generatedAt = null;
+
+  do {
+    const envelope = await fetchKaizenPage(cursor);
+    generatedAt = generatedAt || envelope.generated_at;
+    (envelope.data || []).forEach(raw => leads.push(normalizeLead(raw)));
+    cursor = envelope.has_more ? envelope.next_cursor : null;
+  } while (cursor);
+
+  return { leads, generatedAt };
+}
+
+const MONDAY_FSBO_BOARD  = '6109998503';
+const MONDAY_FSBO_GROUP  = 'group_mm2na3pg';
+
+async function syncLeadsToMonday(leads, apiKey) {
+  if (!apiKey || !leads.length) return 0;
+
+  const BATCH = 10;
+  let synced = 0;
+
+  for (let i = 0; i < leads.length; i += BATCH) {
+    const batch = leads.slice(i, i + BATCH);
+
+    const aliases = batch.map((lead, idx) => {
+      const colVal = {
+        text_mm2qzhf7: lead.address || '',
+        text6:         lead.seller_name || '',
+      };
+      if (lead.price)  colVal.numbers = String(lead.price);
+      if (lead.phone) {
+        const e164 = lead.phone.startsWith('+') ? lead.phone : `+1${lead.phone.replace(/\D/g, '')}`;
+        colVal.seller_phone__1 = { phone: e164, countryShortName: 'US' };
+      }
+
+      // column_values must be a JSON-encoded string literal in GraphQL
+      const colValLiteral = JSON.stringify(JSON.stringify(colVal));
+      const itemName      = JSON.stringify(lead.address || 'Unknown Address');
+
+      return `i${idx}: create_item(board_id: ${MONDAY_FSBO_BOARD}, group_id: "${MONDAY_FSBO_GROUP}", item_name: ${itemName}, column_values: ${colValLiteral}) { id }`;
+    });
+
+    try {
+      const res = await fetch('https://api.monday.com/v2', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: apiKey },
+        body: JSON.stringify({ query: `mutation { ${aliases.join('\n')} }` }),
+        signal: AbortSignal.timeout(20000),
+      });
+      const data = await res.json();
+      if (data.errors) {
+        console.error('[Monday] batch error:', data.errors[0]?.message);
+      } else {
+        synced += batch.length;
+      }
+    } catch (err) {
+      console.error('[Monday] batch failed:', err.message);
+    }
+
+    if (i + BATCH < leads.length) await new Promise(r => setTimeout(r, 400));
+  }
+
+  console.log(`[Monday] synced ${synced}/${leads.length} leads to FSBO Facebook Leads group`);
+  return synced;
+}
+
+async function runKaizenFetch() {
+  console.log(`[${new Date().toISOString()}] Running Kaizen FSBO fetch...`);
+
+  if (!process.env.KAIZEN_API_KEY) {
+    console.error('KAIZEN_API_KEY not set — skipping fetch.');
+    return;
+  }
+
+  try {
+    const { leads, generatedAt } = await fetchAllKaizenLeads();
+
+    if (leads.length === 0) {
+      console.log('Kaizen returned 0 leads.');
+      return;
+    }
+
+    const batchDate = new Date().toISOString().slice(0, 10);
+
+    // Delete today's existing batch so re-runs are idempotent
+    await supabase.from('fsbo_leads').delete().eq('batch_date', batchDate);
+
+    const rows = leads.map(l => ({ ...l, batch_date: batchDate, kaizen_generated_at: generatedAt }));
+
+    const { error } = await supabase.from('fsbo_leads').insert(rows);
+    if (error) throw error;
+
+    // Sync to Monday.com
+    await syncLeadsToMonday(leads, process.env.MONDAY_API_KEY);
+
+    // Record last-fetch metadata in settings
+    await supabase.from('settings').upsert([
+      { key: 'kaizen_last_fetch_at',    value: new Date().toISOString() },
+      { key: 'kaizen_last_fetch_count', value: String(leads.length) },
+    ], { onConflict: 'key' });
+
+    console.log(`✓ Kaizen fetch complete — ${leads.length} leads stored for ${batchDate}`);
+  } catch (err) {
+    console.error('Kaizen fetch failed:', err.message);
+  }
+}
+
+async function shouldRunKaizenFetch() {
+  const { data } = await supabase
+    .from('settings')
+    .select('value')
+    .eq('key', 'kaizen_fetch_hour')
+    .maybeSingle();
+
+  const configuredHour = data?.value ? parseInt(data.value) : 16; // default 4 PM
+
+  // Get current hour in America/New_York (handles EST/EDT automatically)
+  const nowEST = new Date().toLocaleString('en-US', { timeZone: 'America/New_York', hour: 'numeric', hour12: false });
+  const currentHour = parseInt(nowEST);
+
+  return currentHour === configuredHour;
+}
+
+// ─── Cron ────────────────────────────────────────────────────────────────────
+
 // Run every hour at :00
-cron.schedule('0 * * * *', processAutoTransitions);
+cron.schedule('0 * * * *', async () => {
+  processAutoTransitions();
+  if (await shouldRunKaizenFetch()) {
+    runKaizenFetch();
+  }
+});
 
 // Also run once on startup to catch any missed transitions
 processAutoTransitions();
 
-console.log('Ableman scheduler running. Checks every hour.');
+console.log('Ableman scheduler running. Checks every hour. Kaizen fetch at configured EST hour (default 4 PM).');
