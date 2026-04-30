@@ -123,11 +123,11 @@ async function processAutoTransitions() {
 
 function normalizeLead(raw) {
   return {
-    address:     raw.address || raw.street_address || raw.exact_street_address || '',
-    price:       raw.price ?? raw.asking_price ?? null,
-    seller_name: raw.seller_name || raw.sellerName || raw.seller || '',
-    phone:       raw.phone || raw.phone_number || '',
-    images:      raw.images || raw.photos || raw.hosted_property_photos || [],
+    address:     raw['exact street address'] || raw.address || raw.street_address || raw.exact_street_address || '',
+    price:       raw['asking price'] ?? raw.price ?? raw.asking_price ?? null,
+    seller_name: raw['seller name'] || raw.seller_name || raw.sellerName || raw.seller || '',
+    phone:       raw['phone number'] || raw.phone || raw.phone_number || '',
+    images:      raw['hosted property photos'] || raw.images || raw.photos || raw.hosted_property_photos || [],
   };
 }
 
@@ -183,7 +183,6 @@ async function syncLeadsToMonday(leads, apiKey) {
         colVal.seller_phone__1 = { phone: e164, countryShortName: 'US' };
       }
 
-      // column_values must be a JSON-encoded string literal in GraphQL
       const colValLiteral = JSON.stringify(JSON.stringify(colVal));
       const itemName      = JSON.stringify(lead.address || 'Unknown Address');
 
@@ -202,6 +201,27 @@ async function syncLeadsToMonday(leads, apiKey) {
         console.error('[Monday] batch error:', data.errors[0]?.message);
       } else {
         synced += batch.length;
+
+        // Add item updates with photo links for leads that have images
+        const updateAliases = batch
+          .map((lead, idx) => {
+            if (!lead.images?.length) return null;
+            const itemId = data.data?.[`i${idx}`]?.id;
+            if (!itemId) return null;
+            const photosText = lead.images.map((url, n) => `Photo ${n + 1}: ${url}`).join('\n');
+            const body = JSON.stringify(photosText);
+            return `u${idx}: create_update(item_id: ${itemId}, body: ${body}) { id }`;
+          })
+          .filter(Boolean);
+
+        if (updateAliases.length > 0) {
+          await fetch('https://api.monday.com/v2', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: apiKey },
+            body: JSON.stringify({ query: `mutation { ${updateAliases.join('\n')} }` }),
+            signal: AbortSignal.timeout(20000),
+          }).catch(err => console.warn('[Monday] update failed:', err.message));
+        }
       }
     } catch (err) {
       console.error('[Monday] batch failed:', err.message);
@@ -262,20 +282,32 @@ async function shouldRunKaizenFetch() {
     .eq('key', 'kaizen_fetch_hour')
     .maybeSingle();
 
-  const configuredHour = data?.value ? parseInt(data.value) : 16; // default 4 PM
+  const raw = data?.value || '16:00';
+  let configuredHour, configuredMinute;
 
-  // Get current hour in America/New_York (handles EST/EDT automatically)
-  const nowEST = new Date().toLocaleString('en-US', { timeZone: 'America/New_York', hour: 'numeric', hour12: false });
-  const currentHour = parseInt(nowEST);
+  if (raw.includes(':')) {
+    const [h, m] = raw.split(':');
+    configuredHour = parseInt(h);
+    configuredMinute = parseInt(m);
+  } else {
+    configuredHour = parseInt(raw);
+    configuredMinute = 0;
+  }
 
-  return currentHour === configuredHour;
+  // Get current time in America/New_York (handles EST/EDT automatically)
+  const nowEST = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  return nowEST.getHours() === configuredHour && nowEST.getMinutes() === configuredMinute;
 }
 
 // ─── Cron ────────────────────────────────────────────────────────────────────
 
-// Run every hour at :00
-cron.schedule('0 * * * *', async () => {
+// Property transitions: run every hour at :00
+cron.schedule('0 * * * *', () => {
   processAutoTransitions();
+});
+
+// Kaizen FSBO fetch: check every minute for exact time match
+cron.schedule('* * * * *', async () => {
   if (await shouldRunKaizenFetch()) {
     runKaizenFetch();
   }
@@ -284,4 +316,4 @@ cron.schedule('0 * * * *', async () => {
 // Also run once on startup to catch any missed transitions
 processAutoTransitions();
 
-console.log('Ableman scheduler running. Checks every hour. Kaizen fetch at configured EST hour (default 4 PM).');
+console.log('Ableman scheduler running. Property transitions: hourly. Kaizen fetch: checked every minute against configured EST time (default 16:00).');
