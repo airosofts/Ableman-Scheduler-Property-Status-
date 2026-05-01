@@ -181,8 +181,8 @@ async function fetchAllKaizenLeads() {
   return { leads, generatedAt };
 }
 
-const MONDAY_FSBO_BOARD  = '6109998503';
-const MONDAY_FSBO_GROUP  = 'group_mm2na3pg';
+const MONDAY_FSBO_BOARD  = '18411223019';
+const MONDAY_FSBO_GROUP  = 'topics';
 
 async function syncLeadsToMonday(leads, apiKey) {
   if (!apiKey || !leads.length) return 0;
