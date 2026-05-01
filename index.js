@@ -123,21 +123,42 @@ async function processAutoTransitions() {
 
 function normalizeLead(raw) {
   return {
-    address:     raw['exact street address'] || raw.address || raw.street_address || raw.exact_street_address || '',
-    price:       raw['asking price'] ?? raw.price ?? raw.asking_price ?? null,
-    seller_name: raw['seller name'] || raw.seller_name || raw.sellerName || raw.seller || '',
-    phone:       raw['phone number'] || raw.phone || raw.phone_number || '',
-    images:      raw['hosted property photos'] || raw.images || raw.photos || raw.hosted_property_photos || [],
+    lead_id:          raw.lead_id || null,
+    lead_type:        raw.lead_type || 'FSBO',
+    address:          raw['exact street address'] || raw.address || '',
+    price:            raw['asking price'] ?? raw.price ?? null,
+    seller_name:      raw['seller name'] || raw['seller name / company'] || '',
+    phone:            raw['phone number'] || raw['seller contact number'] || '',
+    images:           raw['hosted property photos'] || raw.lead_images || [],
+    beds:             raw.beds ?? null,
+    baths:            raw.baths ?? null,
+    state:            raw.state || '',
+    facebook_post_url: raw.facebook_post_url || null,
   };
 }
 
 async function fetchKaizenPage(cursor) {
   const url = cursor
-    ? `https://api.kaizendata.co/enterprise/leads/raw?limit=100&cursor=${cursor}`
-    : `https://api.kaizendata.co/enterprise/leads/raw?limit=100`;
+    ? `https://api.kaizendata.co/enterprise/leads/query?cursor=${cursor}`
+    : `https://api.kaizendata.co/enterprise/leads/query`;
 
   const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${process.env.KAIZEN_API_KEY}` },
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.KAIZEN_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      lead_types: ['FSBO'],
+      states: 'all',
+      fields: [
+        'lead_id', 'lead_type',
+        'seller name', 'phone number', 'exact street address', 'asking price',
+        'facebook_post_url', 'hosted property photos', 'lead_images',
+        'beds', 'baths', 'state',
+      ],
+      limit: 100,
+    }),
     signal: AbortSignal.timeout(25000),
   });
 
@@ -177,10 +198,13 @@ async function syncLeadsToMonday(leads, apiKey) {
         text_mm2qzhf7: lead.address || '',
         text6:         lead.seller_name || '',
       };
-      if (lead.price)  colVal.numbers = String(lead.price);
+      if (lead.price) colVal.numbers = String(lead.price);
       if (lead.phone) {
         const e164 = lead.phone.startsWith('+') ? lead.phone : `+1${lead.phone.replace(/\D/g, '')}`;
         colVal.seller_phone__1 = { phone: e164, countryShortName: 'US' };
+      }
+      if (lead.facebook_post_url) {
+        colVal.link_mm2ytzv9 = { url: lead.facebook_post_url, text: 'Facebook Post' };
       }
 
       const colValLiteral = JSON.stringify(JSON.stringify(colVal));
